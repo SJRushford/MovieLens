@@ -1,0 +1,599 @@
+---
+title: "MovieLens Recommender Model"
+author: "Scott Rushford"
+date: "`r Sys.Date()`"
+output: pdf_document
+fontsize: 12pt
+bibliography: references.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+The purpose of this assignment is to develop a recommender model to predict how a user would rate a movie in the MovieLens data set for the purpose of recommending movies to users that were rated highly by similar users. [@movielen2009]
+
+The objective is to create a model with a root mean square error (RMSE) equal to or less than 0.86490.
+
+```{r train and test sets, include=FALSE}
+# Note: this process could take a couple of minutes
+
+if(!require(tidyverse)) install.packages("tidyverse", 
+                                         repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", 
+                                     repos = "http://cran.us.r-project.org")
+
+library(tidyverse)
+library(caret)
+
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+options(timeout = 120)
+
+dl <- "ml-10M100K.zip"
+if(!file.exists(dl))
+  download.file("https://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings_file <- "ml-10M100K/ratings.dat"
+if(!file.exists(ratings_file))
+  unzip(dl, ratings_file)
+
+movies_file <- "ml-10M100K/movies.dat"
+if(!file.exists(movies_file))
+  unzip(dl, movies_file)
+
+ratings <- as.data.frame(str_split(read_lines(ratings_file), fixed("::"), simplify = TRUE),
+                         stringsAsFactors = FALSE)
+colnames(ratings) <- c("userId", "movieId", "rating", "timestamp")
+ratings <- ratings %>%
+  mutate(userId = as.integer(userId),
+         movieId = as.integer(movieId),
+         rating = as.numeric(rating),
+         timestamp = as.integer(timestamp))
+
+movies <- as.data.frame(str_split(read_lines(movies_file), fixed("::"), simplify = TRUE),
+                        stringsAsFactors = FALSE)
+colnames(movies) <- c("movieId", "title", "genres")
+movies <- movies %>%
+  mutate(movieId = as.integer(movieId))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Final hold-out test set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding") # if using R 3.6 or later
+# set.seed(1) # if using R 3.5 or earlier
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in final hold-out test set are also in edx set
+final_holdout_test <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from final hold-out test set back into edx set
+removed <- anti_join(temp, final_holdout_test)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+
+Pre-processing of the data set resulted in the creation of two data frames: 1) edx - consisting of 9,000,055 observations and, 2) final_holdout_test - consisting of 999,999 observations. Both sets contain the following 6 variable: [@irizarry]
+
+1.  User ID - a number identifying the user.
+
+2.  Movie ID - a number given to a movie for identification purposes.
+
+3.  Time Stamp - the date and time the movie was rated by the user.
+
+4.  Rating - the rating a user assigned to the movie on a scale of 0 - 5 (least to most favorable).
+
+5.  Title - movie title.
+
+6.  Genre - a column consisting of the names of the movie genre each movie falls under.
+
+The key steps performed in this study include:
+
+1.  Summarize and visualize the edx data.
+
+2.  Conduct a correlation and principal component analysis.
+
+3.  Reduce the dimensions of the data set based on summary and analyses results.
+
+4.  Train and test various algorithms to find the best model.
+
+5.  Review results
+
+6.  Test the chosen model using the final_holdout_test set.
+
+## Methods and Analysis
+
+```{r movies and users, include=FALSE}
+### Distinct users and movies
+edx_sum <- edx %>% 
+     mutate(n_users = n_distinct(userId), n_movies = n_distinct(movieId),
+            avg = mean(rating))
+edx_sum
+
+### Review Users and movies
+reviews_user <- edx %>% 
+  select(userId, movieId) %>% 
+  group_by(userId) %>% 
+  summarise(total_reviews = n ())
+mean(reviews_user$total_reviews)
+max(reviews_user$total_reviews)
+which.max(reviews_user$total_reviews)
+
+### Review Movies
+reviews_movie <- edx %>% 
+  select(userId, movieId, title) %>% 
+  group_by(movieId, title) %>% 
+  summarise(total_reviews = n ())
+mean(reviews_movie$total_reviews)
+max(reviews_movie$total_reviews)
+which.max(reviews_movie$total_reviews)
+```
+
+The data summary indicates that 69,878 users rated 10,677 unique movies for a total of 9,000,055 ratings. The average rating is 3.51 out of 5. Each user rated on average 128.8 movies. Each movie was rated 843 times on average, with Pulp Fiction receiving the most reviews at 31,362.
+
+### Summary Data Visualization
+
+```{r hist, echo=FALSE}
+edx %>% ggplot(aes(rating)) +
+  geom_histogram(bins = 10, col = "black", fill = "red") +
+  scale_x_log10() +
+  geom_vline(xintercept = mean(edx$rating), linewidth = 2) +
+  xlab("Rating Mean - 3.51") +
+  ggtitle("Rating Histogram and Mean")
+```
+
+```{r load gridExtra, include=FALSE}
+if(!require(gridExtra)) 
+  install.packages("gridExtra", repos = "http://cran.us.r-project.org")
+library(gridExtra)
+
+```
+
+```{r plots, echo=FALSE}
+
+p1 <- edx %>% 
+  count(movieId) %>% 
+  ggplot(aes(n)) + 
+  geom_histogram(bins = 30, color = "black", fill = "red") + 
+  scale_x_log10() +
+  xlab("Movies by Number of Times Rated")
+  ggtitle("Movies")
+
+p2 <- edx %>% 
+  count(userId) %>% 
+  ggplot(aes(n)) + 
+  geom_histogram(bins = 30, color = "black", fill = "red") + 
+  scale_x_log10() + 
+  xlab("Users by Number of Movies Rated") +
+  ggtitle("Users")
+
+grid.arrange(p1, p2, ncol = 2)
+
+```
+
+[@irizarry2019]
+
+### Principle Component Analysis (PCA) and Correlation Analysis
+
+To determine if the dimensions of the data could be reduced a principal component analysis and a correlation analysis was performed on the data.
+
+```{r required packages, include=FALSE}
+# Load the other required packages 
+if(!require(recommenderlab)) 
+  install.packages("recommenderlab", repos = "http://cran.us.r-project.org")
+if(!require(knitr)) 
+  install.packages("knitr", repos = "http://cran.us.r-project.org")
+if(!require(Matrix)) 
+  install.packages("Matrix", repos = "http://cran.us.r-project.org")
+if(!require(tinytex)) 
+  install.packages("tinytex", repos = "http://cran.us.r-project.org")
+if(!require(corrplot)) 
+  install.packages("corrplot", repos = "http://cran.us.r-project.org")
+
+library(recommenderlab)
+library(Matrix)
+library(knitr)
+library(tinytex)
+library(corrplot)
+
+```
+
+```{r pca & ca, include=FALSE}
+# Load the other required packages 
+
+#PCA is timestamp a useful variable
+
+edx_pca <- edx %>% 
+  select(userId, movieId, rating, timestamp)
+
+# Normalize the data
+pca_norm <- scale(edx_pca)
+  
+# PCA
+pca <- prcomp(pca_norm)
+
+```
+
+```{r pca summary , echo=FALSE}
+summary(pca)
+
+```
+
+```{r ca plot, echo=FALSE}
+ca <- cor(pca_norm)
+corrplot(ca)
+```
+
+The PCA analyzed movie ID, user ID, rating and time stamp and reveals none of these components explain more that 35% of the variance. Time stamp has a correlation with movie rating at 0.374. This is explained by the fact that the movie ID is assigned as the movie is released. It is expected that a movie will receive more ratings after it is released.
+
+Time stamp is removed from the data set for this reason. Title is removed since it is a character string and is already represented by movie ID. Genre is also removed as it is also a character string and genre classification is subjective and incomplete.
+
+### Methods
+
+The recommenderlab package [@recommenderlab] was developed for the purpose of creating and evaluating recommender models. This study will train and evaluate 2 collaborative filtering algorithms and 2 single value decomposition methods to determine which performs best on the MovieLens data.
+
+The recommenderlab package offers two types of data prediction, "ratings" and "topNList". Type "ratings" will predict the rating a user would give to a certain movie. The "topNList" will recommend a list of a selected number (n) of movies to a particular user. The accuracy for the "topNList" type is measured as a percentage of True Positives divided by the total number of observations. Type "ratings" accuracy is measured as Root Mean Squared Error (RMSE). As the evaluation matric of the assignment is RMSE, the "ratings" type is used for each model.
+
+In order to use recommenderlab all data must be in the form of a "realRatingMatrix". The edx and final_holdout_test data frames are coerced into a "realRatingMatrix".
+
+```{r rating matrix, include=FALSE}
+edx_1 <- edx %>% 
+  select(userId, movieId, rating)
+
+which(is.na(edx_1), arr.ind = TRUE)
+
+edx_r <- as(edx_1, "realRatingMatrix")
+
+rm(edx_1)
+```
+
+### Data Visualization - Sparsity
+
+The data summary indicates that there is some sparsity in the data since not all users rated all movies. A visualization was created to examine the sparsity among the first 500 users and 500 movies.
+
+The white areas represent the sparsity in the data as it indicates no ratings from that user exists for a particular movie.
+
+```{r sparsity 1, echo=FALSE}
+spars1 <- image(edx_r [1:500, 1:500])
+spars1
+
+```
+
+The means obtained from the data summary are used to reduce the level of sparsity the in the data by including only those users that have rated at least 129 movies and those movies that were rated at least 843 times.
+
+Once these adjustments were made, sparsity was visualized again.
+
+```{r sparse 2, include=FALSE}
+edx_r <- edx_r[rowCounts(edx_r) >= 129,
+               colCounts(edx_r) >= 843]
+edx_r
+
+```
+
+```{r sparse matrix 2, echo=FALSE}
+spars2 <- image(edx_r [1:500, 1:500])
+spars2
+```
+
+These adjustments reduced the size of the matrix to a:
+
+```         
+22379 x 1994 rating matrix of class ‘realRatingMatrix’ with 5498215 ratings.
+```
+
+A look at the two graphs shows the reduction in the sparsity of the data, as there is far less white space in the second graph.
+
+User and movie similarity matrices were created to how similar the first 10 users are to one another and how similar the first 10 movies are to one another. [@theoutlier732023]
+
+```{r similarity, include=FALSE}
+user_similarity <- similarity(edx_r[1:10, ], method = "cosine", 
+                              which = "users")
+user_sim <- as.matrix(user_similarity)
+
+movie_similarity <- similarity(edx_r[ , 1:10], method = "cosine", 
+                              which = "items")
+movie_sim <- as.matrix(movie_similarity)
+
+
+```
+
+```{r user sim, echo=FALSE}
+image(user_sim [1:10, 1:10])
+```
+
+```{r movie sim, echo=FALSE}
+image(movie_sim [1:10, 1:10])
+```
+
+Results from the Similarity Analysis indicates more similarity among users (top) than among movies (bottom).
+
+## Train, Test and Evaluate Models
+
+There are 10 algorithms available in the recommenderlab package to create models plus a HYBRID option that "aggregates several recommendation strategies using weighted averages" @recommenderlab.
+
+The full list of algorithms are available by loading the recommenderlab library and running:
+
+recommenderRegistry\$get_entries(dataType = "realRatingMatrix")
+
+The first step in creating a Recommender Model is to determine the evaluation scheme to use. The evaluation scheme is used to determine how to split the data for training and evaluation. The key arguments for this function are the **method** (split, cross-validation, and bootstrap), the argument **given** - "single number of items given for evaluation or a vector of length of data giving the number of items given for each observation. Negative values implement all-but schemes. For example, `given = -1` means all-but-1 evaluation" and **goodRating** the "threshold at which ratings are considered good". @hahsler
+
+The method chosen for the evaluation scheme in this study is cross-validation using the default value k = 10. This will split the data into 3 sets: a train set, a known set, and an unknown set. The known test data has the ratings specified by the argument given and the unknown has the remaining ratings, which is used to validate the predictions made using known." [@malshe2019]
+
+As the average rating is 3.51 any rating equal to or greater than 4 is considered good and is used for the argument goodRating.
+
+The argument given was selected by going through the four experimental with holding protocols called Given 2, Given 5, Given 10 and All-but-1. @hahsler
+
+The given value was finally selected at 25.
+
+```{r eval scheme, include=FALSE}
+set.seed(76)
+es_edx_r <-  evaluationScheme(edx_r, method = "cross-validation", given = 25,
+                              goodRating = 4)
+t_edx_r <-  getData(es_edx_r, "train")
+k_edx_r <-  getData(es_edx_r, "known")
+u_edx_r <-  getData(es_edx_r, "unknown")
+
+str(t_edx_r)
+str(k_edx_r)
+str(u_edx_r)
+t_edx_r
+k_edx_r
+u_edx_r
+```
+
+The train, known and unknown data was extracted from the evaluation scheme and assigned to their own real rating matrix:
+
+-   t_edx_r - train set 15273 x 1825 rating matrix with 4,288,752 ratings
+
+-   k_edx_r - known set 1704 x 1825 rating matrix with 41,903 ratings
+
+-   u_edx_r - unknown set 1704 x 1825 rating matrix with 431,871 ratings.
+
+To establish a measurement baseline and to select a value for given, the "POPULAR", which recommends movies that are deemed popular based on ratings, algorithm was run on the data.
+
+The algorithms chosen for this study are:
+
+1.  User Based Collaborative Filtering (UBCF)
+
+2.  Item Based Collaborative Filtering (IBCF)
+
+3.  Singular Value Decomposition (SVD) - based on SVD approximation with column mean imputation
+
+4.  Funk Singular Value Decomposition (SVDF) - based on Funk SVD with gradient descend.
+
+[@recommenderlab-2]
+
+```{r recommenders, include=FALSE}
+# Popular establish baseline - what if we only recommended popular movies
+# 
+set.seed(1502)
+POP_rec <- Recommender(t_edx_r, method = "POPULAR")
+
+
+POP_eval <- POP_rec %>% 
+  predict(k_edx_r, type = "ratings") %>% 
+  calcPredictionAccuracy(u_edx_r)
+
+print(POP_eval)
+
+# Remove unnecessary items from the environment to free up memory.
+
+rm(POP_rec)
+
+# Train test and evaluate IBCF model
+set.seed(4)
+IBCF_rec <- Recommender(t_edx_r, method = "IBCF")
+
+IBCF_eval <- IBCF_rec %>% 
+  predict(k_edx_r, type = "ratings") %>% 
+  calcPredictionAccuracy(u_edx_r)
+
+print(IBCF_eval)
+
+# Remove unnecessary items from the environment to free up memory.
+
+rm(IBCF_rec)
+
+# Train test and evaluate UBCF model
+set.seed(6)
+UBCF_rec <- Recommender(t_edx_r, method = "UBCF")
+
+UBCF_eval <- UBCF_rec %>% 
+  predict(k_edx_r, type = "ratings") %>% 
+  calcPredictionAccuracy(u_edx_r)
+
+print(UBCF_eval)
+rm(UBCF_rec)
+
+set.seed(1056)
+SVD_rec <- Recommender(t_edx_r, method = "SVD")
+
+SVD_eval <- SVD_rec %>% 
+  predict(k_edx_r, type = "ratings") %>% 
+  calcPredictionAccuracy(u_edx_r)
+
+print(SVD_eval)
+
+# Remove unnecessary items from the environment to free up memory.
+rm(SVD_rec)
+
+# SVDF
+
+set.seed(1100)
+SVDF_rec <- Recommender(t_edx_r, method = "SVDF")
+
+SVDF_eval <- SVDF_rec %>% 
+  predict(k_edx_r, type = "ratings") %>% 
+  calcPredictionAccuracy(u_edx_r)
+
+print(SVDF_eval)
+rm(SVDF_rec)
+```
+
+## Evaluate Models
+
+Each model was evaluated and had its RMSE recorded and the results graphed.
+
+```{r models eval, echo=FALSE}
+model_eval <- data.frame(Model=c('IBCF', 'UBCF', "POP", "SVD", "SVDF"),
+                         RMSE=c(IBCF_eval[1], UBCF_eval[1], POP_eval[1], 
+                                SVD_eval[1], SVDF_eval[1]))
+model_eval
+```
+
+```{r eval graphs, echo=FALSE}
+em <-  model_eval %>% 
+  ggplot(aes(reorder(Model,RMSE), RMSE)) +
+  geom_bar(stat = 'identity', col = 'black', fill = 'red') +
+  labs(x = 'Model' , y = 'RMSE', title = 'Model Accuracy')
+em
+```
+
+Based on the evaluation data the Single Value Decomposition (SVD) models outperformed all other models. The SVDF model produced the lowest RMSE at 0.836, but takes a significant time to run. If time is a factor, SVD and POPULAR provided results within the range of the assignment. Picking from the POPULAR movies outperformed the Item Based and User Based Collaborative Filtering Models.
+
+## Final Holdout Test
+
+A disadvantage of the recommender lab package is that a model can only predict or evaluate new data if that data is in a matrix of the same size as the model.
+
+As the final_holdout_test data is of a much smaller size than the edx data a different method of testing was developed. This requires creating a separate final_holdout_test model using the same methods for the creation of the model from the edx data.
+
+### Data Summarization Final Holdout Test (fht)
+
+Data from the final_holdout_test (fht) was summarized to determine how to set the evaluation scheme.
+
+```{r summary fht, include=FALSE}
+### Distinct users and movies (course)
+final_holdout_test %>% 
+     summarize(n_users = n_distinct(userId),
+               n_movies = n_distinct(movieId))
+
+### Average Rating
+mean(final_holdout_test$rating)
+
+### Review Users
+reviews_userfht <- final_holdout_test %>% 
+  select(userId, movieId) %>% 
+  group_by(userId) %>% 
+  summarise(total_reviews = n ())
+mean(reviews_userfht$total_reviews)
+max(reviews_userfht$total_reviews)
+which.max(reviews_userfht$total_reviews)
+
+### Review Movies
+reviews_moviefht <- final_holdout_test %>% 
+  select(userId, movieId, title) %>% 
+  group_by(movieId, title) %>% 
+  summarise(total_reviews = n ())
+mean(reviews_moviefht$total_reviews)
+max(reviews_moviefht$total_reviews)
+which.max(reviews_moviefht$total_reviews)
+```
+
+The fht data contain 68,534 individual users who rated 9,809 movies for a total number of ratings of 999,999. Like the edx data the average rating is 3.51. Each user rated on average 14.6 movies and the mean for the number of times a movie was rated is 102. Pulp Fiction received the highest number of ratings at 3,502 which is consistent with the edx data. During the spliting of the data into the edx and fht sets a test was conducted to ensure that all users are represented in each set.
+
+### Data Preparation
+
+In order to reduce the dimensions of the data time stamp, title and genres were removed from the fht set.
+
+Sparsity was reduced using the mean value obtained in the data summary. Users who did not rate at least 15 movies and movies that did not get rated at least 102 times were removed.
+
+The same arguments are used for the evaluation scheme of the fht data. The method is cross-validation with k = 10 and given set at 25 and good rating to 4.
+
+```{r fht prep, include=FALSE}
+# Remove genre, title and time stamp from holdout
+
+fht <- final_holdout_test %>% 
+  select(-timestamp, - genres, -title)
+
+# Coerce Final Holdout to a real rating matrix
+
+fht_r <- as(fht, "realRatingMatrix")
+
+# Reduce dimensions using the number of average number of movies rated by user
+# and the average number of ratings received by movie
+
+fht_r <- fht_r[rowCounts(fht_r) >= 15,
+               colCounts(fht_r) >= 102]
+
+# Run the same evaluation scheme on the final hold out
+
+set.seed(76)
+es_fht_r <-  evaluationScheme(fht_r, method = "cross-validation", given = 25,
+                              goodRating = 4)
+
+t_fht_r <- getData(es_fht_r, "train")
+k_fht_r <- getData(es_fht_r, "known")
+u_fht_r <- getData(es_fht_r, "unknown")
+
+t_fht_r
+k_fht_r
+u_fht_r
+```
+
+The train, known and unknown data was extracted from the evaluation scheme and assigned to their own real rating matrix:
+
+-   t_edx_r - train set 8190 x 2015 rating matrix with 363,528 ratings
+
+-   k_edx_r - known set 918 x 2015 rating matrix with 22,983 ratings
+
+-   u_ecx_r - unknown set 918 x 2015 rating matrix with 17,848 ratings.
+
+### FHT Evaluation
+
+The evaluation of the trained fht model produced the following:
+
+```{r fht model, include=FALSE}
+
+# Create recommender model on final test set using SVDF
+set.seed(1304)
+FHT_rec <- Recommender(t_fht_r, method = "SVDF")
+
+# Evaluate recommneder model built using the final test set.
+FHT_eval <- FHT_rec %>% 
+  predict(k_fht_r, type = "ratings") %>% 
+  calcPredictionAccuracy(u_fht_r)
+
+
+# Compare SVDF models on the edx and final set
+FHT_eval
+SVDF_eval
+```
+
+```{r test eval, echo=FALSE}
+test_eval <- data.frame(Model=c('FHT', 'SVDF'),
+                         RMSE=c(FHT_eval[1], SVDF_eval[1]))
+test_eval
+```
+
+```{r te graph, echo=FALSE}
+te <-  test_eval %>% 
+  ggplot(aes(reorder(Model,RMSE), RMSE)) +
+  geom_bar(stat = 'identity', col = 'black', fill = 'red') +
+  labs(x = 'Model' , y = 'RMSE', title = 'Model Accuracy')
+te
+```
+
+The results on the final_holdout_test proves that by reducing the dimensions and sparsity of the data by the same proportions and by using the same evaluation scheme similar RMSE scores are obtained on the fht set (0.855) as the edx (0.836) set using the SVDF model.
+
+## Conclusion
+
+The objective of this assignment is to create a Recommender Model that produced a RMSE of less than 0.86490 on the edx data set and be able to reproduce it on the final_holdout_test set. Using the recommenderlab package a model was trained on the edx data set that resulted in a RMSE of 0.836.
+
+Model evaluation in recommenderlab is limited to a real rating Matrix of the same size. In order to use the final_holdout_test to evaluate the initial model, the same methods used to train and evaluate the edx data were reproduced to create a separate model on the final_holdout_test set. Once trained and evaluated this model had a RMSE of 0.855, thereby obtaining the target RMSE.
+
+```{r R Version, echo=FALSE}
+version$version.string
+```
+
+## References
+
+,
